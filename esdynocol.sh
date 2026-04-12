@@ -5,10 +5,22 @@ set -o pipefail
 APP_NAME="esdynocol"
 
 # =====================================================
-# CONFIG (XDG + fallback)
+# CONFIG LOCATION RESOLUTION
 # =====================================================
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME"
-[[ -d "$CONFIG_DIR" ]] || CONFIG_DIR="$HOME/.esdynocol"
+POSSIBLE_DIRS=(
+    "${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME"
+    "$HOME/.esdynocol"
+    "/roms/tools/$APP_NAME"
+)
+
+CONFIG_DIR=""
+
+for d in "${POSSIBLE_DIRS[@]}"; do
+    if [[ -d "$d" ]] || mkdir -p "$d" 2>/dev/null; then
+        CONFIG_DIR="$d"
+        break
+    fi
+done
 
 mkdir -p "$CONFIG_DIR"
 
@@ -26,9 +38,6 @@ DRY_RUN=0
 DIFF_MODE=0
 SHOW_IGNORED=0
 
-# =====================================================
-# ARG PARSER
-# =====================================================
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
@@ -38,14 +47,15 @@ for arg in "$@"; do
 done
 
 # =====================================================
-# BOOTSTRAP CONFIG
+# AUTO CREATE DEFAULT CONFIGS (NO INSTALL STEP NEEDED)
 # =====================================================
 bootstrap_config() {
 
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$COLLECTION_DIR"
 
-    [[ -f "$MAP_FILE" ]] || cat > "$MAP_FILE" << 'EOF'
+    if [[ ! -f "$MAP_FILE" ]]; then
+        cat > "$MAP_FILE" << 'EOF'
 rpg=rpgs
 role playing=rpgs
 platform=platformers
@@ -59,8 +69,10 @@ puzzle=puzzle
 strategy=strategy
 simulation=simulation
 EOF
+    fi
 
-    [[ -f "$WHITELIST_FILE" ]] || cat > "$WHITELIST_FILE" << 'EOF'
+    if [[ ! -f "$WHITELIST_FILE" ]]; then
+        cat > "$WHITELIST_FILE" << 'EOF'
 action
 adventure
 arcade
@@ -79,6 +91,7 @@ music
 party
 pinball
 EOF
+    fi
 
     [[ -f "$CACHE_FILE" ]] || touch "$CACHE_FILE"
 }
@@ -142,16 +155,13 @@ run_engine() {
     load_config
 
     declare -A GENRE_COUNT
-    declare -A IGNORED_UNMAPPED
-    declare -A IGNORED_BLOCKED
-
-    # 🧠 DEDUP FIX (runtime protection)
     declare -A SEEN
 
     mkdir -p "$COLLECTION_DIR"
     touch "$CACHE_FILE"
 
-    echo "Scanning gamelist.xml files..."
+    echo "Using config: $CONFIG_DIR"
+    echo "Scanning gamelists..."
 
     while IFS= read -r gamelist; do
 
@@ -184,13 +194,9 @@ run_engine() {
                 [[ -z "$raw" ]] && continue
 
                 g=$(normalize_genre "$raw")
-
                 [[ -z "$g" ]] && continue
                 is_allowed "$g" || continue
 
-                # =================================================
-                # 🧠 DEDUP FIX (per-run protection)
-                # =================================================
                 key="${g}|${FULL_PATH}"
 
                 if [[ -z "${SEEN[$key]}" ]]; then
@@ -214,27 +220,12 @@ run_engine() {
             -v "concat(path,'|',genre)" -n "$gamelist" 2>/dev/null
         )
 
-        # cache update
         grep -v "^$gamelist|" "$CACHE_FILE" > "$CACHE_FILE.tmp" 2>/dev/null || true
         mv "$CACHE_FILE.tmp" "$CACHE_FILE"
         echo "$gamelist|$current_hash" >> "$CACHE_FILE"
 
     done < <(find "$ROM_ROOT" -type f -name "gamelist.xml")
 
-    # =================================================
-    # FINAL FILE CLEANUP (IMPORTANT)
-    # =================================================
-    echo ""
-    echo "Deduplicating output files..."
-
-    for f in "$COLLECTION_DIR"/custom-*.cfg; do
-        [[ -f "$f" ]] || continue
-        sort -u "$f" -o "$f"
-    done
-
-    # =================================================
-    # SUMMARY
-    # =================================================
     echo ""
     echo "===== GENRE STATS ====="
     for g in "${!GENRE_COUNT[@]}"; do
