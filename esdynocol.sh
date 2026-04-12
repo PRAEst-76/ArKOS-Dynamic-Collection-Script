@@ -5,13 +5,10 @@ set -o pipefail
 APP_NAME="esdynocol"
 
 # =====================================================
-# CONFIG LAYER
+# CONFIG (XDG + fallback)
 # =====================================================
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME"
-
-if [[ ! -d "$CONFIG_DIR" ]]; then
-    CONFIG_DIR="$HOME/.esdynocol"
-fi
+[[ -d "$CONFIG_DIR" ]] || CONFIG_DIR="$HOME/.esdynocol"
 
 mkdir -p "$CONFIG_DIR"
 
@@ -28,32 +25,27 @@ COLLECTION_DIR="${COLLECTION_DIR:-$HOME/.emulationstation/collections}"
 DRY_RUN=0
 DIFF_MODE=0
 SHOW_IGNORED=0
-INSTALL_MODE=0
 
 # =====================================================
 # ARG PARSER
 # =====================================================
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --dry-run) DRY_RUN=1; shift ;;
-        --diff) DIFF_MODE=1; shift ;;
-        --show-ignored) SHOW_IGNORED=1; shift ;;
-        --install) INSTALL_MODE=1; shift ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        --diff) DIFF_MODE=1 ;;
+        --show-ignored) SHOW_IGNORED=1 ;;
     esac
 done
 
 # =====================================================
-# INSTALL MODE
+# BOOTSTRAP CONFIG
 # =====================================================
-install_tool() {
-
-    echo "Installing $APP_NAME..."
+bootstrap_config() {
 
     mkdir -p "$CONFIG_DIR"
+    mkdir -p "$COLLECTION_DIR"
 
-    # create default configs
-    [[ ! -f "$MAP_FILE" ]] && cat > "$MAP_FILE" << 'EOF'
+    [[ -f "$MAP_FILE" ]] || cat > "$MAP_FILE" << 'EOF'
 rpg=rpgs
 role playing=rpgs
 platform=platformers
@@ -68,7 +60,7 @@ strategy=strategy
 simulation=simulation
 EOF
 
-    [[ ! -f "$WHITELIST_FILE" ]] && cat > "$WHITELIST_FILE" << 'EOF'
+    [[ -f "$WHITELIST_FILE" ]] || cat > "$WHITELIST_FILE" << 'EOF'
 action
 adventure
 arcade
@@ -88,45 +80,17 @@ party
 pinball
 EOF
 
-    [[ ! -f "$CACHE_FILE" ]] && touch "$CACHE_FILE"
-
-    echo "Config created at: $CONFIG_DIR"
-
-    echo ""
-    echo "Optional: install auto-run on boot? (y/n)"
-    read -r ans
-    if [[ "$ans" == "y" ]]; then
-        CRON_CMD="@reboot $PWD/esdynocol.sh >/dev/null 2>&1"
-        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
-        echo "Installed boot autostart via cron."
-    fi
-
-    exit 0
+    [[ -f "$CACHE_FILE" ]] || touch "$CACHE_FILE"
 }
-
-# run install if requested
-[[ "$INSTALL_MODE" -eq 1 ]] && install_tool
-
-# =====================================================
-# STARTUP MESSAGE
-# =====================================================
-echo "======================================"
-echo "esdynocol - EmulationStation DynaCol"
-echo "======================================"
-echo "Config: $CONFIG_DIR"
-echo "Mode: $( [[ $DRY_RUN -eq 1 ]] && echo DRY-RUN || echo NORMAL )"
-echo "Diff: $( [[ $DIFF_MODE -eq 1 ]] && echo ON || echo OFF )"
-echo "Ignored logging: $( [[ $SHOW_IGNORED -eq 1 ]] && echo ON || echo OFF )"
-echo "======================================"
 
 # =====================================================
 # HELPERS
 # =====================================================
 trim() {
-    local var="$1"
-    var="${var#"${var%%[![:space:]]*}"}"
-    var="${var%"${var##*[![:space:]]}"}"
-    echo -n "$var"
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    echo -n "$v"
 }
 
 decode_xml() {
@@ -135,20 +99,18 @@ decode_xml() {
     echo "$s"
 }
 
-# =====================================================
-# LOAD CONFIGS
-# =====================================================
 declare -A GENRE_MAP
 
-while IFS="=" read -r key value; do
-    key=$(trim "$key")
-    value=$(trim "$value")
-    [[ -z "$key" || "$key" =~ ^# ]] && continue
-    key=$(echo "$key" | tr '[:upper:]' '[:lower:]')
-    GENRE_MAP["$key"]="$value"
-done < "$MAP_FILE"
+load_config() {
+    while IFS="=" read -r k v; do
+        k=$(trim "$k")
+        v=$(trim "$v")
+        [[ -z "$k" || "$k" =~ ^# ]] && continue
+        GENRE_MAP["$(echo "$k" | tr '[:upper:]' '[:lower:]')"]="$v"
+    done < "$MAP_FILE"
 
-mapfile -t WHITELIST < "$WHITELIST_FILE"
+    mapfile -t WHITELIST < "$WHITELIST_FILE"
+}
 
 is_allowed() {
     local g="$1"
@@ -159,126 +121,132 @@ is_allowed() {
 }
 
 normalize_genre() {
-    local input="$1"
-    input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+    local in="$1"
+    in=$(echo "$in" | tr '[:upper:]' '[:lower:]')
 
-    for key in "${!GENRE_MAP[@]}"; do
-        [[ "$input" == *"$key"* ]] && {
-            echo "${GENRE_MAP[$key]}"
+    for k in "${!GENRE_MAP[@]}"; do
+        [[ "$in" == *"$k"* ]] && {
+            echo "${GENRE_MAP[$k]}"
             return 0
         }
     done
-
     return 1
 }
 
 # =====================================================
-# MAIN ENGINE
+# ENGINE
 # =====================================================
-declare -A GENRE_COUNT
-declare -A IGNORED_UNMAPPED
-declare -A IGNORED_BLOCKED
+run_engine() {
 
-mkdir -p "$COLLECTION_DIR"
-touch "$CACHE_FILE"
+    bootstrap_config
+    load_config
 
-echo "Scanning gamelist.xml..."
+    declare -A GENRE_COUNT
+    declare -A IGNORED_UNMAPPED
+    declare -A IGNORED_BLOCKED
 
-while IFS= read -r gamelist; do
+    # 🧠 DEDUP FIX (runtime protection)
+    declare -A SEEN
 
-    current_hash=$(md5sum "$gamelist" | awk '{print $1}')
-    cached_hash=$(grep "^$gamelist|" "$CACHE_FILE" | cut -d'|' -f2)
+    mkdir -p "$COLLECTION_DIR"
+    touch "$CACHE_FILE"
 
-    if [[ "$current_hash" == "$cached_hash" && "$DRY_RUN" -eq 0 && "$DIFF_MODE" -eq 0 ]]; then
-        echo "Skipping: $gamelist"
-        continue
-    fi
+    echo "Scanning gamelist.xml files..."
 
-    echo "Processing: $gamelist"
+    while IFS= read -r gamelist; do
 
-    SYSTEM_DIR=$(dirname "$gamelist")
+        echo "Processing: $gamelist"
 
-    TMP_OUTPUT=$(mktemp)
+        current_hash=$(md5sum "$gamelist" | awk '{print $1}')
+        cached_hash=$(grep "^$gamelist|" "$CACHE_FILE" | cut -d'|' -f2)
 
-    while IFS="|" read -r path genre; do
+        if [[ "$current_hash" == "$cached_hash" && "$DRY_RUN" -eq 0 && "$DIFF_MODE" -eq 0 ]]; then
+            echo "Skipping unchanged"
+            continue
+        fi
 
-        CLEAN_PATH="${path#./}"
-        FULL_PATH="$SYSTEM_DIR/$CLEAN_PATH"
+        SYSTEM_DIR=$(dirname "$gamelist")
 
-        genre=$(decode_xml "$genre")
-        genre=$(echo "$genre" | sed 's/action-adventure/action,adventure/Ig')
-        genre=$(echo "$genre" | sed 's/ *, */,/g')
+        while IFS="|" read -r path genre; do
 
-        IFS=',' read -ra GENRES <<< "$genre"
+            CLEAN_PATH="${path#./}"
+            FULL_PATH="$SYSTEM_DIR/$CLEAN_PATH"
 
-        for raw in "${GENRES[@]}"; do
-            raw=$(trim "$raw")
-            [[ -z "$raw" ]] && continue
+            genre=$(decode_xml "$genre")
+            genre=$(echo "$genre" | sed 's/action-adventure/action,adventure/Ig')
+            genre=$(echo "$genre" | sed 's/ *, */,/g')
 
-            g=$(normalize_genre "$raw")
+            IFS=',' read -ra GENRES <<< "$genre"
 
-            if [[ -z "$g" ]]; then
-                [[ "$SHOW_IGNORED" -eq 1 ]] && IGNORED_UNMAPPED["$raw"]=$(( ${IGNORED_UNMAPPED["$raw"]:-0} + 1 ))
-                continue
-            fi
+            for raw in "${GENRES[@]}"; do
 
-            if ! is_allowed "$g"; then
-                [[ "$SHOW_IGNORED" -eq 1 ]] && IGNORED_BLOCKED["$g"]=$(( ${IGNORED_BLOCKED["$g"]:-0} + 1 ))
-                continue
-            fi
+                raw=$(trim "$raw")
+                [[ -z "$raw" ]] && continue
 
-            if [[ "$DRY_RUN" -eq 1 ]]; then
-                echo "[DRY] $g -> $FULL_PATH"
-                continue
-            fi
+                g=$(normalize_genre "$raw")
 
-            if [[ "$DIFF_MODE" -eq 1 ]]; then
-                echo "$FULL_PATH" >> "$TMP_OUTPUT"
-                continue
-            fi
+                [[ -z "$g" ]] && continue
+                is_allowed "$g" || continue
 
-            echo "$FULL_PATH" >> "$COLLECTION_DIR/custom-$g.cfg"
-            GENRE_COUNT["$g"]=$(( ${GENRE_COUNT["$g"]:-0} + 1 ))
+                # =================================================
+                # 🧠 DEDUP FIX (per-run protection)
+                # =================================================
+                key="${g}|${FULL_PATH}"
 
-        done
+                if [[ -z "${SEEN[$key]}" ]]; then
 
-    done < <(
-        xmlstarlet sel -t -m "//game[genre]" \
-        -v "concat(path,'|',genre)" -n "$gamelist" 2>/dev/null
-    )
+                    if [[ "$DRY_RUN" -eq 1 ]]; then
+                        echo "[DRY] $g -> $FULL_PATH"
+                    elif [[ "$DIFF_MODE" -eq 1 ]]; then
+                        echo "$FULL_PATH"
+                    else
+                        echo "$FULL_PATH" >> "$COLLECTION_DIR/custom-$g.cfg"
+                        GENRE_COUNT["$g"]=$(( ${GENRE_COUNT[$g]:-0} + 1 ))
+                    fi
 
-    # cache update
-    if [[ "$DRY_RUN" -eq 0 && "$DIFF_MODE" -eq 0 ]]; then
+                    SEEN["$key"]=1
+                fi
+
+            done
+
+        done < <(
+            xmlstarlet sel -t -m "//game[genre]" \
+            -v "concat(path,'|',genre)" -n "$gamelist" 2>/dev/null
+        )
+
+        # cache update
         grep -v "^$gamelist|" "$CACHE_FILE" > "$CACHE_FILE.tmp" 2>/dev/null || true
         mv "$CACHE_FILE.tmp" "$CACHE_FILE"
         echo "$gamelist|$current_hash" >> "$CACHE_FILE"
-    fi
 
-done < <(find "$ROM_ROOT" -type f -name "gamelist.xml")
+    done < <(find "$ROM_ROOT" -type f -name "gamelist.xml")
 
-# =====================================================
-# REPORTING
-# =====================================================
-echo ""
-echo "========== SUMMARY =========="
-for g in "${!GENRE_COUNT[@]}"; do
-    printf "%-15s %5d\n" "$g" "${GENRE_COUNT[$g]}"
-done | sort
-
-if [[ "$SHOW_IGNORED" -eq 1 ]]; then
+    # =================================================
+    # FINAL FILE CLEANUP (IMPORTANT)
+    # =================================================
     echo ""
-    echo "========== IGNORED =========="
-    echo "-- Unmapped --"
-    for k in "${!IGNORED_UNMAPPED[@]}"; do
-        printf "%-30s %5d\n" "$k" "${IGNORED_UNMAPPED[$k]}"
+    echo "Deduplicating output files..."
+
+    for f in "$COLLECTION_DIR"/custom-*.cfg; do
+        [[ -f "$f" ]] || continue
+        sort -u "$f" -o "$f"
+    done
+
+    # =================================================
+    # SUMMARY
+    # =================================================
+    echo ""
+    echo "===== GENRE STATS ====="
+    for g in "${!GENRE_COUNT[@]}"; do
+        printf "%-15s %5d\n" "$g" "${GENRE_COUNT[$g]}"
     done | sort
 
     echo ""
-    echo "-- Blocked --"
-    for k in "${!IGNORED_BLOCKED[@]}"; do
-        printf "%-30s %5d\n" "$k" "${IGNORED_BLOCKED[$k]}"
-    done | sort
-fi
+    echo "Done."
+    read -r -p "Press ENTER..."
+}
 
-echo ""
-echo "Done."
+# =====================================================
+# ENTRY
+# =====================================================
+run_engine
