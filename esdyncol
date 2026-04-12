@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# --- Defaults (ArkOS typical paths) ---
+ROM_ROOT="${ROM_ROOT:-/roms}"
+COLLECTION_DIR="${COLLECTION_DIR:-$HOME/.emulationstation/collections}"
+
+# Optional config file
+CONFIG_FILE="${CONFIG_FILE:-$HOME/.gamelist_collections.cfg}"
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+mkdir -p "$COLLECTION_DIR"
+
+echo "ROM root: $ROM_ROOT"
+echo "Collections dir: $COLLECTION_DIR"
+
+# --- Genre normalization tuned for ES themes ---
+normalize_genre() {
+    local g="$1"
+
+    g=$(echo "$g" | tr '[:upper:]' '[:lower:]' | xargs)
+
+    case "$g" in
+        *rpg*|*"role playing"*|*"role-playing"*)
+            echo "rpgs";;
+
+        *platform*)
+            echo "platformers";;
+
+        *shooter*|*shoot*)
+            echo "shooter";;
+
+        *beat*em*up*|*brawler*)
+            echo "brawlers";;
+
+        *fighting*)
+            echo "fighting";;
+
+        *racing*|*driving*)
+            echo "racing";;
+
+        *sports*)
+            echo "sports";;
+
+        *puzzle*)
+            echo "puzzle";;
+
+        *strategy*)
+            echo "strategy";;
+
+        *simulation*|*simulator*)
+            echo "simulation";;
+
+        *arcade*)
+            echo "arcade";;
+
+        *adventure*)
+            echo "adventure";;
+
+        *action*)
+            echo "action";;
+
+        *horror*)
+            echo "horror";;
+
+        *music*|*rhythm*)
+            echo "music";;
+
+        *party*)
+            echo "party";;
+
+        *pinball*)
+            echo "pinball";;
+
+        *)
+            # fallback: sanitize
+            echo "$g" | tr ' ' '_' | tr -cd '[:alnum:]_-'
+            ;;
+    esac
+}
+
+# --- Clean old generated collections ---
+find "$COLLECTION_DIR" -name "custom-*.cfg" -delete
+
+# --- Process gamelists ---
+find "$ROM_ROOT" -type f -name "gamelist.xml" | while read -r gamelist; do
+    SYSTEM_DIR=$(dirname "$gamelist")
+
+    xmlstarlet sel -t -m "//game[genre]" \
+        -v "concat(path,'|',genre)" -n "$gamelist" | while IFS="|" read -r path genre; do
+
+        CLEAN_PATH="${path#./}"
+        FULL_PATH="$SYSTEM_DIR/$CLEAN_PATH"
+
+        genre=$(echo "$genre" | sed 's/ *, */,/g')
+        IFS=',' read -ra GENRES <<< "$genre"
+
+        for raw_g in "${GENRES[@]}"; do
+            raw_g=$(echo "$raw_g" | xargs)
+            [ -z "$raw_g" ] && continue
+
+            g=$(normalize_genre "$raw_g")
+            [ -z "$g" ] && continue
+
+            COLLECTION_FILE="$COLLECTION_DIR/custom-$g.cfg"
+            echo "$FULL_PATH" >> "$COLLECTION_FILE"
+        done
+    done
+done
+
+# --- Deduplicate entries ---
+for file in "$COLLECTION_DIR"/custom-*.cfg; do
+    [ -f "$file" ] && sort -u "$file" -o "$file"
+done
+
+echo "ArkOS collections generated."
