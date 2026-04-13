@@ -1,4 +1,4 @@
-##### ArkOS / dArkOs Dynamic Collections script
+##### ArkOS / dArkOs Dynamic Collection script
 *or*  
 ### EmulationStation Dynamic Collection script
 *or*  
