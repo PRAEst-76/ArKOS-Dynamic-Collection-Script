@@ -3,7 +3,7 @@
 ### EmulationStation Dynamic Collection script
 *or*  
 
-![Esdynocol](https://github.com/user-attachments/assets/e9370227-adc1-4d95-9bd0-853b6e57e36b)
+![Esdynocol](https://github.com/user-attachments/assets/3b5c6c74-1c13-46a8-a2a2-122e7854b75f)
 
 A bash script to scan [ArkOS](https://github.com/christianhaitian/arkos/) / [dArkOs](https://github.com/christianhaitian/dArkOS/) EmulationStation gamelists and generate custom genre collections in /home/ark/.emulationstation/collections/
 
