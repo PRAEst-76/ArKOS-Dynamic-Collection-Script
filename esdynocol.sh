@@ -4,24 +4,7 @@ set -o pipefail
 
 APP_NAME="esdynocol"
 
-# =====================================================
-# CONFIG LOCATION RESOLUTION
-# =====================================================
-POSSIBLE_DIRS=(
-    "${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME"
-    "$HOME/.esdynocol"
-    "/roms/tools/$APP_NAME"
-)
-
-CONFIG_DIR=""
-
-for d in "${POSSIBLE_DIRS[@]}"; do
-    if [[ -d "$d" ]] || mkdir -p "$d" 2>/dev/null; then
-        CONFIG_DIR="$d"
-        break
-    fi
-done
-
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME"
 mkdir -p "$CONFIG_DIR"
 
 MAP_FILE="$CONFIG_DIR/genre_map.cfg"
@@ -31,53 +14,49 @@ CACHE_FILE="$CONFIG_DIR/cache.txt"
 ROM_ROOT="${ROM_ROOT:-/roms}"
 COLLECTION_DIR="${COLLECTION_DIR:-$HOME/.emulationstation/collections}"
 
-# =====================================================
-# MODES
-# =====================================================
+AUDIT_MODE=0
 DRY_RUN=0
-DIFF_MODE=0
-SHOW_IGNORED=0
 
 for arg in "$@"; do
     case "$arg" in
+        --audit) AUDIT_MODE=1 ;;
         --dry-run) DRY_RUN=1 ;;
-        --diff) DIFF_MODE=1 ;;
-        --show-ignored) SHOW_IGNORED=1 ;;
     esac
 done
 
-# =====================================================
-# AUTO CREATE DEFAULT CONFIGS (NO INSTALL STEP NEEDED)
-# =====================================================
 bootstrap_config() {
 
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$COLLECTION_DIR"
 
-    if [[ ! -f "$MAP_FILE" ]]; then
-        cat > "$MAP_FILE" << 'EOF'
+    # Genre map (with your theme fix)
+    [[ -f "$MAP_FILE" ]] || cat > "$MAP_FILE" << 'EOF'
 rpg=rpgs
 role playing=rpgs
+jrpg=rpgs
+dungeon crawler=rpgs
 platform=platformers
 shooter=shooter
 action=action
+action-adventure=action
 adventure=adventure
 arcade=arcade
-fighting=fighting
+fighting=btmups
+beat em up=btmups
+beat'em up=btmups
+brawlers=btmups
 sports=sports
 puzzle=puzzle
 strategy=strategy
 simulation=simulation
 EOF
-    fi
 
-    if [[ ! -f "$WHITELIST_FILE" ]]; then
-        cat > "$WHITELIST_FILE" << 'EOF'
+    # Whitelist
+    [[ -f "$WHITELIST_FILE" ]] || cat > "$WHITELIST_FILE" << 'EOF'
 action
 adventure
 arcade
-brawlers
-fighting
+btmups
 platformers
 puzzle
 racing
@@ -91,14 +70,20 @@ music
 party
 pinball
 EOF
-    fi
 
+    # Cache
     [[ -f "$CACHE_FILE" ]] || touch "$CACHE_FILE"
 }
 
 # =====================================================
-# HELPERS
+# LOAD CONFIG
 # =====================================================
+declare -A GENRE_MAP
+declare -A SEEN
+declare -A SEEN_RUN
+declare -A AUDIT
+declare -A IGNORED
+
 trim() {
     local v="$1"
     v="${v#"${v%%[![:space:]]*}"}"
@@ -106,15 +91,14 @@ trim() {
     echo -n "$v"
 }
 
-decode_xml() {
-    local s="$1"
-    s=$(echo "$s" | sed "s/&apos;/'/g; s/&amp;/\&/g")
-    echo "$s"
-}
-
-declare -A GENRE_MAP
-
 load_config() {
+
+    [[ -f "$CACHE_FILE" ]] || touch "$CACHE_FILE"
+
+    while IFS= read -r line; do
+        SEEN["$line"]=1
+    done < "$CACHE_FILE"
+
     while IFS="=" read -r k v; do
         k=$(trim "$k")
         v=$(trim "$v")
@@ -146,36 +130,29 @@ normalize_genre() {
     return 1
 }
 
+decode_xml() {
+    echo "$1" | sed "s/&apos;/'/g; s/&amp;/\&/g"
+}
+
 # =====================================================
 # ENGINE
 # =====================================================
-run_engine() {
+run() {
 
     bootstrap_config
     load_config
 
-    declare -A GENRE_COUNT
-    declare -A SEEN
-
-    mkdir -p "$COLLECTION_DIR"
-    touch "$CACHE_FILE"
-
-    echo "Using config: $CONFIG_DIR"
     echo "Scanning gamelists..."
 
     while IFS= read -r gamelist; do
 
-        echo "Processing: $gamelist"
-
-        current_hash=$(md5sum "$gamelist" | awk '{print $1}')
-        cached_hash=$(grep "^$gamelist|" "$CACHE_FILE" | cut -d'|' -f2)
-
-        if [[ "$current_hash" == "$cached_hash" && "$DRY_RUN" -eq 0 && "$DIFF_MODE" -eq 0 ]]; then
-            echo "Skipping unchanged"
-            continue
-        fi
-
         SYSTEM_DIR=$(dirname "$gamelist")
+        SYSTEM_NAME=$(basename "$SYSTEM_DIR")
+
+        echo "Processing: $SYSTEM_NAME"
+
+        xmlstarlet sel -t -m "//game" \
+            -v "concat(path,'|',genre)" -n "$gamelist" 2>/dev/null |
 
         while IFS="|" read -r path genre; do
 
@@ -183,61 +160,71 @@ run_engine() {
             FULL_PATH="$SYSTEM_DIR/$CLEAN_PATH"
 
             genre=$(decode_xml "$genre")
-            genre=$(echo "$genre" | sed 's/action-adventure/action,adventure/Ig')
-            genre=$(echo "$genre" | sed 's/ *, */,/g')
 
             IFS=',' read -ra GENRES <<< "$genre"
 
             for raw in "${GENRES[@]}"; do
 
-                raw=$(trim "$raw")
+                raw="$(trim "$raw")"
                 [[ -z "$raw" ]] && continue
 
-                g=$(normalize_genre "$raw")
-                [[ -z "$g" ]] && continue
+                AUDIT["$raw"]=$(( ${AUDIT["$raw"]:-0} + 1 ))
+
+                g="$(normalize_genre "$raw")"
+
+                # STRICT: no mapping → ignore
+                if [[ -z "$g" ]]; then
+                    IGNORED["$raw"]=$(( ${IGNORED["$raw"]:-0} + 1 ))
+                    continue
+                fi
+
+                # STRICT whitelist enforcement
                 is_allowed "$g" || continue
 
-                key="${g}|${FULL_PATH}"
+                key="$g|$FULL_PATH"
 
-                if [[ -z "${SEEN[$key]}" ]]; then
+                # DUPLICATE FIX (run + cache)
+                if [[ -z "${SEEN[$key]}" && -z "${SEEN_RUN[$key]}" ]]; then
 
-                    if [[ "$DRY_RUN" -eq 1 ]]; then
-                        echo "[DRY] $g -> $FULL_PATH"
-                    elif [[ "$DIFF_MODE" -eq 1 ]]; then
-                        echo "$FULL_PATH"
-                    else
+                    if [[ "$DRY_RUN" -eq 0 ]]; then
                         echo "$FULL_PATH" >> "$COLLECTION_DIR/custom-$g.cfg"
-                        GENRE_COUNT["$g"]=$(( ${GENRE_COUNT[$g]:-0} + 1 ))
+                        echo "$key" >> "$CACHE_FILE"
+                    else
+                        echo "[DRY] $g -> $FULL_PATH"
                     fi
 
                     SEEN["$key"]=1
+                    SEEN_RUN["$key"]=1
                 fi
 
             done
+        done
 
-        done < <(
-            xmlstarlet sel -t -m "//game[genre]" \
-            -v "concat(path,'|',genre)" -n "$gamelist" 2>/dev/null
-        )
+    done < <(find "$ROM_ROOT" \
+        -type d -name ".*" -prune -o \
+        -type f -name "gamelist.xml" -print)
 
-        grep -v "^$gamelist|" "$CACHE_FILE" > "$CACHE_FILE.tmp" 2>/dev/null || true
-        mv "$CACHE_FILE.tmp" "$CACHE_FILE"
-        echo "$gamelist|$current_hash" >> "$CACHE_FILE"
+    # =====================================================
+    # AUDIT OUTPUT
+    # =====================================================
+    if [[ "$AUDIT_MODE" -eq 1 ]]; then
 
-    done < <(find "$ROM_ROOT" -type f -name "gamelist.xml")
+        echo ""
+        echo "===== RAW GENRES ====="
+        for k in "${!AUDIT[@]}"; do
+            printf "%-30s %5d\n" "$k" "${AUDIT[$k]}"
+        done | sort
 
-    echo ""
-    echo "===== GENRE STATS ====="
-    for g in "${!GENRE_COUNT[@]}"; do
-        printf "%-15s %5d\n" "$g" "${GENRE_COUNT[$g]}"
-    done | sort
+        echo ""
+        echo "===== IGNORED (NOT MAPPED) ====="
+        for k in "${!IGNORED[@]}"; do
+            printf "%-30s %5d\n" "$k" "${IGNORED[$k]}"
+        done | sort
+    fi
 
     echo ""
     echo "Done."
     read -r -p "Press ENTER..."
 }
 
-# =====================================================
-# ENTRY
-# =====================================================
-run_engine
+run
